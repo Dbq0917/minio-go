@@ -107,6 +107,11 @@ type Client struct {
 
 	healthStatus int32
 
+	// Learned offset between the local clock and the server clock in
+	// nanoseconds, applied to all signing times so signatures are
+	// anchored to the server's time base. See clock-skew.go.
+	clockOffset atomic.Int64
+
 	trailingHeaderSupport bool
 	maxRetries            int
 
@@ -686,6 +691,10 @@ func (c *Client) do(req *http.Request) (resp *http.Response, err error) {
 		}
 	}
 
+	// Learn the server clock offset from the Date response header so
+	// that subsequent signing uses the server's time base.
+	c.updateClockOffset(resp.Header)
+
 	return resp, nil
 }
 
@@ -809,6 +818,14 @@ func (c *Client) executeMethod(ctx context.Context, method string, metadata requ
 		// For errors verify if its retryable otherwise fail quickly.
 		errResponse := ToErrorResponse(apiErr)
 		err = errResponse
+
+		// The server rejected the request time as too skewed. The
+		// clock offset has already been updated from the response
+		// Date header in Client.do, so retry with the corrected
+		// signing time.
+		if errResponse.Code == RequestTimeTooSkewed {
+			continue // Retry.
+		}
 
 		// Bucket region if set in error response and the error
 		// code dictates invalid region, we can retry the request
@@ -1053,13 +1070,13 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		}
 		if signerType.IsV2() {
 			// Presign URL with signature v2.
-			req = signer.PreSignV2(*req, accessKeyID, secretAccessKey, metadata.expires, isVirtualHost)
+			req = signer.PreSignV2WithTime(*req, accessKeyID, secretAccessKey, metadata.expires, isVirtualHost, c.now())
 		} else if signerType.IsV4() {
 			// Presign URL with signature v4.
 			if s3utils.IsAmazonOutpostsEndpoint(*c.endpointURL) {
-				req = signer.PreSignV4Outposts(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.expires)
+				req = signer.PreSignV4OutpostsWithTime(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.expires, c.now())
 			} else {
-				req = signer.PreSignV4(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.expires)
+				req = signer.PreSignV4WithTime(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.expires, c.now())
 			}
 		}
 		return req, nil
@@ -1108,7 +1125,7 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 	switch {
 	case signerType.IsV2():
 		// Add signature version '2' authorization header.
-		req = signer.SignV2(*req, accessKeyID, secretAccessKey, isVirtualHost)
+		req = signer.SignV2WithTime(*req, accessKeyID, secretAccessKey, isVirtualHost, c.now())
 	case metadata.streamSha256 && !c.secure:
 		if len(metadata.trailer) > 0 {
 			req.Trailer = metadata.trailer
@@ -1118,13 +1135,13 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		// if yes then we don't need to perform streaming signature.
 		if s3utils.IsAmazonExpressRegionalEndpoint(*c.endpointURL) {
 			req = signer.StreamingSignV4Express(req, accessKeyID,
-				secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
+				secretAccessKey, sessionToken, location, metadata.contentLength, c.now(), c.sha256Hasher())
 		} else if s3utils.IsAmazonOutpostsEndpoint(*c.endpointURL) {
 			req = signer.StreamingSignV4Outposts(req, accessKeyID,
-				secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
+				secretAccessKey, sessionToken, location, metadata.contentLength, c.now(), c.sha256Hasher())
 		} else {
 			req = signer.StreamingSignV4(req, accessKeyID,
-				secretAccessKey, sessionToken, location, metadata.contentLength, time.Now().UTC(), c.sha256Hasher())
+				secretAccessKey, sessionToken, location, metadata.contentLength, c.now(), c.sha256Hasher())
 		}
 	default:
 		// Set sha256 sum for signature calculation only with signature version '4'.
@@ -1140,14 +1157,14 @@ func (c *Client) newRequest(ctx context.Context, method string, metadata request
 		}
 		req.Header.Set("X-Amz-Content-Sha256", shaHeader)
 
+		// Add signature version '4' authorization header.
+		serviceType := signer.ServiceTypeS3
 		if s3utils.IsAmazonExpressRegionalEndpoint(*c.endpointURL) {
-			req = signer.SignV4TrailerExpress(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
+			serviceType = signer.ServiceTypeS3Express
 		} else if s3utils.IsAmazonOutpostsEndpoint(*c.endpointURL) {
-			req = signer.SignV4TrailerOutposts(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
-		} else {
-			// Add signature version '4' authorization header.
-			req = signer.SignV4Trailer(*req, accessKeyID, secretAccessKey, sessionToken, location, metadata.trailer)
+			serviceType = signer.ServiceTypeS3Outposts
 		}
+		req = signer.SignV4TrailerWithTime(*req, accessKeyID, secretAccessKey, sessionToken, location, serviceType, metadata.trailer, c.now())
 	}
 
 	// Return request.

@@ -58,12 +58,19 @@ func encodeURL2Path(req *http.Request, virtualHost bool) (path string) {
 // PreSignV2 - presign the request in following style.
 // https://${S3_BUCKET}.s3.amazonaws.com/${S3_OBJECT}?AWSAccessKeyId=${S3_ACCESS_KEY}&Expires=${TIMESTAMP}&Signature=${SIGNATURE}.
 func PreSignV2(req http.Request, accessKeyID, secretAccessKey string, expires int64, virtualHost bool) *http.Request {
+	return PreSignV2WithTime(req, accessKeyID, secretAccessKey, expires, virtualHost, time.Now().UTC())
+}
+
+// PreSignV2WithTime - presign the request like PreSignV2 but uses the
+// provided time as the signing time instead of the local clock. This
+// allows callers to sign with a server-synchronized clock so that the
+// URL validity window is anchored to the server's time base.
+func PreSignV2WithTime(req http.Request, accessKeyID, secretAccessKey string, expires int64, virtualHost bool, d time.Time) *http.Request {
 	// Presign is not needed for anonymous credentials.
 	if accessKeyID == "" || secretAccessKey == "" {
 		return &req
 	}
 
-	d := time.Now().UTC()
 	// Find epoch expires when the request will expire.
 	epochExpires := d.Unix() + expires
 
@@ -128,13 +135,16 @@ func PostPresignSignatureV2(policyBase64, secretAccessKey string) string {
 
 // SignV2 sign the request before Do() (AWS Signature Version 2).
 func SignV2(req http.Request, accessKeyID, secretAccessKey string, virtualHost bool) *http.Request {
+	return SignV2WithTime(req, accessKeyID, secretAccessKey, virtualHost, time.Now().UTC())
+}
+
+// SignV2WithTime sign the request like SignV2 but uses the provided time
+// as the signing time instead of the local clock.
+func SignV2WithTime(req http.Request, accessKeyID, secretAccessKey string, virtualHost bool, d time.Time) *http.Request {
 	// Signature calculation is not needed for anonymous credentials.
 	if accessKeyID == "" || secretAccessKey == "" {
 		return &req
 	}
-
-	// Initial time.
-	d := time.Now().UTC()
 
 	// Add date if not present.
 	if date := req.Header.Get("Date"); date == "" {

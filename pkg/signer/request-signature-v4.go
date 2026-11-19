@@ -208,16 +208,38 @@ func getStringToSignV4(t time.Time, location, canonicalRequest, serviceType stri
 // PreSignV4 presign the request, in accordance with
 // http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html.
 func PreSignV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, expires int64) *http.Request {
+	return PreSignV4WithTime(req, accessKeyID, secretAccessKey, sessionToken, location, expires, time.Now().UTC())
+}
+
+// PreSignV4WithTime presigns the request like PreSignV4 but uses the
+// provided time as the signing time instead of the local clock. This
+// allows callers to sign with a server-synchronized clock so that the
+// URL validity window is anchored to the server's time base.
+func PreSignV4WithTime(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, expires int64, t time.Time) *http.Request {
+	return preSignV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3, expires, t)
+}
+
+// PreSignV4Outposts presign the request for S3 on Outposts (service name s3-outposts).
+func PreSignV4Outposts(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, expires int64) *http.Request {
+	return PreSignV4OutpostsWithTime(req, accessKeyID, secretAccessKey, sessionToken, location, expires, time.Now().UTC())
+}
+
+// PreSignV4OutpostsWithTime presigns the request like PreSignV4Outposts
+// but uses the provided time as the signing time instead of the local clock.
+func PreSignV4OutpostsWithTime(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, expires int64, t time.Time) *http.Request {
+	return preSignV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Outposts, expires, t)
+}
+
+// preSignV4 presigns the request for the given service type using the
+// provided signing time.
+func preSignV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, location, serviceType string, expires int64, t time.Time) *http.Request {
 	// Presign is not needed for anonymous credentials.
 	if accessKeyID == "" || secretAccessKey == "" {
 		return &req
 	}
 
-	// Initial time.
-	t := time.Now().UTC()
-
 	// Get credential string.
-	credential := GetCredential(accessKeyID, location, t, ServiceTypeS3)
+	credential := GetCredential(accessKeyID, location, t, serviceType)
 
 	// Get all signed headers.
 	signedHeaders := getSignedHeaders(req, v4IgnoredHeaders)
@@ -243,10 +265,10 @@ func PreSignV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, loc
 	canonicalRequest := getCanonicalRequest(req, v4IgnoredHeaders, getHashedPayload(req))
 
 	// Get string to sign from canonical request.
-	stringToSign := getStringToSignV4(t, location, canonicalRequest, ServiceTypeS3)
+	stringToSign := getStringToSignV4(t, location, canonicalRequest, serviceType)
 
 	// Gext hmac signing key.
-	signingKey := getSigningKey(secretAccessKey, location, t, ServiceTypeS3)
+	signingKey := getSigningKey(secretAccessKey, location, t, serviceType)
 
 	// Calculate signature.
 	signature := getSignature(signingKey, stringToSign)
@@ -254,38 +276,6 @@ func PreSignV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, loc
 	// Add signature header to RawQuery.
 	req.URL.RawQuery += "&X-Amz-Signature=" + signature
 
-	return &req
-}
-
-// PreSignV4Outposts presign the request for S3 on Outposts (service name s3-outposts).
-func PreSignV4Outposts(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, expires int64) *http.Request {
-	// Presign is not needed for anonymous credentials.
-	if accessKeyID == "" || secretAccessKey == "" {
-		return &req
-	}
-
-	t := time.Now().UTC()
-	credential := GetCredential(accessKeyID, location, t, ServiceTypeS3Outposts)
-	signedHeaders := getSignedHeaders(req, v4IgnoredHeaders)
-	query := req.URL.Query()
-	query.Set("X-Amz-Algorithm", signV4Algorithm)
-	query.Set("X-Amz-Date", t.Format(iso8601DateFormat))
-	query.Set("X-Amz-Expires", strconv.FormatInt(expires, 10))
-	query.Set("X-Amz-SignedHeaders", signedHeaders)
-	query.Set("X-Amz-Credential", credential)
-	if sessionToken != "" {
-		if v := req.Header.Get("x-amz-s3session-token"); v != "" {
-			query.Set("X-Amz-S3session-Token", sessionToken)
-		} else {
-			query.Set("X-Amz-Security-Token", sessionToken)
-		}
-	}
-	req.URL.RawQuery = query.Encode()
-	canonicalRequest := getCanonicalRequest(req, v4IgnoredHeaders, getHashedPayload(req))
-	stringToSign := getStringToSignV4(t, location, canonicalRequest, ServiceTypeS3Outposts)
-	signingKey := getSigningKey(secretAccessKey, location, t, ServiceTypeS3Outposts)
-	signature := getSignature(signingKey, stringToSign)
-	req.URL.RawQuery += "&X-Amz-Signature=" + signature
 	return &req
 }
 
@@ -301,18 +291,15 @@ func PostPresignSignatureV4(policyBase64 string, t time.Time, secretAccessKey, l
 
 // SignV4STS - signature v4 for STS request.
 func SignV4STS(req http.Request, accessKeyID, secretAccessKey, location string) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, "", location, ServiceTypeSTS, nil)
+	return signV4(req, accessKeyID, secretAccessKey, "", location, ServiceTypeSTS, nil, time.Now().UTC())
 }
 
 // Internal function called for different service types.
-func signV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, location, serviceType string, trailer http.Header) *http.Request {
+func signV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, location, serviceType string, trailer http.Header, t time.Time) *http.Request {
 	// Signature calculation is not needed for anonymous credentials.
 	if accessKeyID == "" || secretAccessKey == "" {
 		return &req
 	}
-
-	// Initial time.
-	t := time.Now().UTC()
 
 	// Set x-amz-date.
 	req.Header.Set("X-Amz-Date", t.Format(iso8601DateFormat))
@@ -406,38 +393,46 @@ func UnsignedTrailer(req http.Request, trailer http.Header) *http.Request {
 // SignV4 sign the request before Do(), in accordance with
 // http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html.
 func SignV4(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3, nil)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3, nil, time.Now().UTC())
 }
 
 // SignV4Express sign the request before Do(), in accordance with
 // http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html.
 func SignV4Express(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Express, nil)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Express, nil, time.Now().UTC())
 }
 
 // SignV4TrailerExpress sign the request before Do(), in accordance with
 // http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
 func SignV4TrailerExpress(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, trailer http.Header) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Express, trailer)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Express, trailer, time.Now().UTC())
 }
 
 // SignV4Trailer sign the request before Do(), in accordance with
 // http://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
 func SignV4Trailer(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, trailer http.Header) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3, trailer)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3, trailer, time.Now().UTC())
+}
+
+// SignV4TrailerWithTime signs the request like SignV4Trailer but uses the
+// provided time as the signing time instead of the local clock, and the
+// provided service type for the signing scope. This allows callers to sign
+// with a server-synchronized clock.
+func SignV4TrailerWithTime(req http.Request, accessKeyID, secretAccessKey, sessionToken, location, serviceType string, trailer http.Header, t time.Time) *http.Request {
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, serviceType, trailer, t)
 }
 
 // SignV4Outposts sign the request for S3 on Outposts (service name s3-outposts).
 func SignV4Outposts(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Outposts, nil)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Outposts, nil, time.Now().UTC())
 }
 
 // SignV4WithServiceType signs a request with AWS Signature Version 4 using a custom service type.
 func SignV4WithServiceType(req http.Request, accessKeyID, secretAccessKey, sessionToken, location, serviceType string) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, serviceType, nil)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, serviceType, nil, time.Now().UTC())
 }
 
 // SignV4TrailerOutposts sign the request with trailer for S3 on Outposts (service name s3-outposts).
 func SignV4TrailerOutposts(req http.Request, accessKeyID, secretAccessKey, sessionToken, location string, trailer http.Header) *http.Request {
-	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Outposts, trailer)
+	return signV4(req, accessKeyID, secretAccessKey, sessionToken, location, ServiceTypeS3Outposts, trailer, time.Now().UTC())
 }

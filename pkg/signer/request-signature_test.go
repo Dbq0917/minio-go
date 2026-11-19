@@ -19,9 +19,63 @@ package signer
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// Tests that the WithTime presign variants anchor the signature to the
+// provided time instead of the local clock.
+func TestPreSignWithTime(t *testing.T) {
+	signTime := time.Date(2026, time.November, 20, 10, 0, 0, 0, time.UTC)
+
+	req, err := http.NewRequest(http.MethodPut, "https://s3.amazonaws.com/bucket/object", nil)
+	if err != nil {
+		t.Fatal("Error:", err)
+	}
+	req = PreSignV4WithTime(*req, "ACCESS-KEY", "SECRET-KEY", "", "us-east-1", 300, signTime)
+	query := req.URL.Query()
+	if got := query.Get("X-Amz-Date"); got != "20261120T100000Z" {
+		t.Fatalf("Error: expected X-Amz-Date 20261120T100000Z, got %q", got)
+	}
+	if got := query.Get("X-Amz-Expires"); got != "300" {
+		t.Fatalf("Error: expected X-Amz-Expires 300, got %q", got)
+	}
+	if !strings.Contains(req.URL.RawQuery, "X-Amz-Signature=") {
+		t.Fatal("Error: expected X-Amz-Signature query resource.")
+	}
+
+	req, err = http.NewRequest(http.MethodPut, "https://s3.amazonaws.com/bucket/object", nil)
+	if err != nil {
+		t.Fatal("Error:", err)
+	}
+	req = PreSignV2WithTime(*req, "ACCESS-KEY", "SECRET-KEY", 300, false, signTime)
+	if got := req.URL.Query().Get("Expires"); got != strconv.FormatInt(signTime.Unix()+300, 10) {
+		t.Fatalf("Error: expected Expires %d, got %q", signTime.Unix()+300, got)
+	}
+	if !strings.Contains(req.URL.RawQuery, "Signature=") {
+		t.Fatal("Error: expected Signature query resource.")
+	}
+}
+
+// Tests that SignV4TrailerWithTime stamps the request with the provided
+// signing time.
+func TestSignV4TrailerWithTime(t *testing.T) {
+	signTime := time.Date(2026, time.November, 20, 10, 0, 0, 0, time.UTC)
+
+	req, err := http.NewRequest(http.MethodPut, "https://s3.amazonaws.com/bucket/object", nil)
+	if err != nil {
+		t.Fatal("Error:", err)
+	}
+	req = SignV4TrailerWithTime(*req, "ACCESS-KEY", "SECRET-KEY", "", "us-east-1", ServiceTypeS3, nil, signTime)
+	if got := req.Header.Get("X-Amz-Date"); got != "20261120T100000Z" {
+		t.Fatalf("Error: expected X-Amz-Date 20261120T100000Z, got %q", got)
+	}
+	if req.Header.Get("Authorization") == "" {
+		t.Fatal("Error: expected Authorization header.")
+	}
+}
 
 // Tests signature calculation.
 func TestSignatureCalculationV4(t *testing.T) {

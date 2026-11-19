@@ -156,8 +156,8 @@ func (c *Client) PresignedPostPolicy(ctx context.Context, p *PostPolicy) (u *url
 		return nil, nil, errInvalidArgument("Presigned operations are not supported for anonymous credentials")
 	}
 
-	// Keep time.
-	t := time.Now().UTC()
+	// Keep time, anchored to the server's time base.
+	t := c.now()
 	// For signature version '2' handle here.
 	if signerType.IsV2() {
 		policyBase64 := p.base64()
