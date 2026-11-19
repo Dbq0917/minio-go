@@ -137,7 +137,9 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 	uploadPartsCh := make(chan uploadPartReq)
 
 	// Declare a channel that sends back the response of a part upload.
-	uploadedPartsCh := make(chan uploadedPartRes)
+	// Buffered so a worker that hits an error after the collector has stopped
+	// reading can still deliver its result and exit instead of leaking.
+	uploadedPartsCh := make(chan uploadedPartRes, opts.getNumThreads())
 
 	// Used for readability, lastPartNumber is always totalPartsCount.
 	lastPartNumber := totalPartsCount
@@ -157,9 +159,9 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 		}
 	}()
 
-	// Receive each part number from the channel allowing three parallel uploads.
+	// Receive each part number from the channel allowing parallel uploads.
 	for w := 1; w <= opts.getNumThreads(); w++ {
-		go func(partSize int64) {
+		go func() {
 			for {
 				var uploadReq uploadPartReq
 				var ok bool
@@ -173,26 +175,32 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 					// Each worker will draw from the part channel and upload in parallel.
 				}
 
-				// If partNumber was not uploaded we calculate the missing
-				// part offset and size. For all other part numbers we
-				// calculate offset based on multiples of partSize.
+				// Compute this part's geometry into locals: the shared
+				// partSize variable must never be mutated from a worker, or
+				// concurrent uploads race and can send the wrong part size.
+				partReadSize := partSize
 				readOffset := int64(uploadReq.PartNum-1) * partSize
-
-				// As a special case if partNumber is lastPartNumber, we
-				// calculate the offset based on the last part size.
 				if uploadReq.PartNum == lastPartNumber {
 					readOffset = size - lastPartSize
-					partSize = lastPartSize
+					partReadSize = lastPartSize
 				}
 
-				sectionReader := newHook(io.NewSectionReader(reader, readOffset, partSize), opts.Progress)
-				trailer := make(http.Header, 1)
-				if withChecksum {
+				// Build a fresh, independently seekable reader per attempt. A
+				// SectionReader rewinds to the part offset on every retry, so a
+				// response lost after the server persisted the part re-PUTs the
+				// identical bytes under the same, stable part number.
+				newPartAttempt := func() partUploadAttempt {
+					sectionReader := newHook(io.NewSectionReader(reader, readOffset, partReadSize), opts.Progress)
+					if !withChecksum {
+						return partUploadAttempt{reader: sectionReader}
+					}
+					trailer := make(http.Header, 1)
 					crc := opts.AutoChecksum.Hasher()
 					trailer.Set(opts.AutoChecksum.Key(), base64.StdEncoding.EncodeToString(crc.Sum(nil)))
-					sectionReader = newHashReaderWrapper(sectionReader, crc, func(hash []byte) {
+					wrapped := newHashReaderWrapper(sectionReader, crc, func(hash []byte) {
 						trailer.Set(opts.AutoChecksum.Key(), base64.StdEncoding.EncodeToString(hash))
 					})
+					return partUploadAttempt{reader: wrapped, trailer: trailer}
 				}
 
 				// Proceed to upload the part.
@@ -200,15 +208,13 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 					bucketName:   bucketName,
 					objectName:   objectName,
 					uploadID:     uploadID,
-					reader:       sectionReader,
 					partNumber:   uploadReq.PartNum,
-					size:         partSize,
+					size:         partReadSize,
 					sse:          opts.ServerSideEncryption,
 					streamSha256: !opts.DisableContentSha256,
 					sha256Hex:    "",
-					trailer:      trailer,
 				}
-				objPart, err := c.uploadPart(ctx, p)
+				objPart, err := c.uploadPartWithRetry(ctx, p, newPartAttempt)
 				if err != nil {
 					select {
 					case <-ctx.Done():
@@ -234,7 +240,7 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 				}:
 				}
 			}
-		}(partSize)
+		}()
 	}
 
 	// Gather the responses as they occur and update any
@@ -555,6 +561,8 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 
 		wg.Add(1)
 		go func(partNumber int) {
+			defer wg.Done()
+
 			// Calculate md5sum.
 			customHeader := make(http.Header)
 			if opts.AutoChecksum.IsSet() {
@@ -580,12 +588,10 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 				md5Hash.Close()
 			}
 
-			defer wg.Done()
 			p := uploadPartParams{
 				bucketName:   bucketName,
 				objectName:   objectName,
 				uploadID:     uploadID,
-				reader:       bytes.NewReader(buf[:length]),
 				partNumber:   partNumber,
 				md5Base64:    md5Base64,
 				size:         int64(length),
@@ -593,18 +599,29 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 				streamSha256: !opts.DisableContentSha256,
 				customHeader: customHeader,
 			}
-			objPart, uerr := c.uploadPart(ctx, p)
+			// A fresh bytes.Reader per attempt keeps the body fully
+			// rewindable for every retry. The buffer itself is owned by
+			// this goroutine until success, so concurrent attempts never
+			// observe a buffer that was handed back for reuse.
+			objPart, uerr := c.uploadPartWithRetry(ctx, p, func() partUploadAttempt {
+				return partUploadAttempt{reader: bytes.NewReader(buf[:length])}
+			})
 			if uerr != nil {
 				errCh <- uerr
 				return
 			}
 
-			// Save successfully uploaded part metadata.
+			// Save successfully uploaded part metadata. The map is keyed by
+			// part number, which is unique per goroutine; even if a retried
+			// attempt re-PUT the same part, only one entry can ever exist and
+			// CompleteMultipartUpload cannot receive a duplicated part number.
 			mu.Lock()
 			partsInfo[partNumber] = objPart
 			mu.Unlock()
 
-			// Send buffer back so it can be reused.
+			// Return the buffer only after the part is durably accepted, so a
+			// goroutine still retrying never uploads bytes the feeder loop has
+			// already overwritten with the next part.
 			bufs <- buf
 		}(partNumber)
 

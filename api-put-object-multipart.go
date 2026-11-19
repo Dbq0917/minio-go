@@ -30,11 +30,89 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
+
+// partUploadMaxAttempts bounds the per-part retries applied on top of the
+// transport-level retries inside executeMethod. A part upload is keyed by its
+// (uploadID, partNumber) pair, so re-sending the same part simply overwrites
+// whatever the server stored under that number: the operation is idempotent and
+// can therefore be retried safely even when the fate of a previous attempt is
+// unknown (for example a response lost after the server persisted the part).
+const partUploadMaxAttempts = 4
+
+// isPartUploadRetryable reports whether a failed UploadPart attempt is worth
+// retrying. It mirrors the classification used by executeMethod so that the
+// part-level layer retries exactly the same transient faults, while permanent
+// errors (signature problems, access denied, entity too large, ...) surface
+// immediately instead of burning the whole attempt budget.
+func isPartUploadRetryable(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	errResp := ToErrorResponse(err)
+	if isS3CodeRetryable(errResp.Code) || isHTTPStatusRetryable(errResp.StatusCode) {
+		return true
+	}
+	// A response-less transport fault (reset connection, dial timeout, ...)
+	// carries no S3 code or HTTP status; judge it on the underlying error.
+	if errResp.StatusCode == 0 && errResp.Code == "" {
+		return isRequestErrorRetryable(ctx, err)
+	}
+	return false
+}
+
+// partUploadAttempt bundles the body and trailing headers for one UploadPart
+// try. A new instance is produced per attempt so a streaming checksum hasher
+// never carries state over from a failed request.
+type partUploadAttempt struct {
+	reader  io.Reader
+	trailer http.Header
+}
+
+// uploadPartWithRetry uploads a single part, retrying transient failures while
+// keeping the part number stable across attempts. The part body must be
+// rewindable so every attempt sends the identical bytes; callers produce a
+// fresh attempt per retry. A part that the server may already have accepted is
+// re-PUT under the same part number, which the S3 multipart API treats as an
+// overwrite rather than a second part, so completion never sees a duplicate
+// part number.
+func (c *Client) uploadPartWithRetry(ctx context.Context, p uploadPartParams, newAttempt func() partUploadAttempt) (ObjectPart, error) {
+	var err error
+	for attempt := range partUploadMaxAttempts {
+		if attempt > 0 {
+			// Exponential backoff shared across all in-flight parts: with many
+			// workers this also acts as gentle adaptive throttling when the
+			// server answers SlowDown.
+			wait := DefaultRetryUnit * time.Duration(1<<uint(attempt-1))
+			if wait > DefaultRetryCap {
+				wait = DefaultRetryCap
+			}
+			select {
+			case <-ctx.Done():
+				return ObjectPart{}, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+
+		a := newAttempt()
+		p.reader = a.reader
+		p.trailer = a.trailer
+		var objPart ObjectPart
+		objPart, err = c.uploadPart(ctx, p)
+		if err == nil {
+			return objPart, nil
+		}
+		if !isPartUploadRetryable(ctx, err) {
+			return ObjectPart{}, err
+		}
+	}
+	return ObjectPart{}, err
+}
 
 func (c *Client) putObjectMultipart(ctx context.Context, bucketName, objectName string, reader io.Reader, size int64,
 	opts PutObjectOptions,
