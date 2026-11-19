@@ -89,10 +89,21 @@ type PutObjectOptions struct {
 	StorageClass            string
 	WebsiteRedirectLocation string
 	PartSize                uint64
-	LegalHold               LegalHoldStatus
-	SendContentMd5          bool
-	DisableContentSha256    bool
-	DisableMultipart        bool
+
+	// UploadID continues an existing multipart upload instead of starting a
+	// new one. When set, PutObject lists the parts the server already stored
+	// and uses the part size recorded there, so an upload started with a
+	// different PartSize (including one computed by an older client) can still
+	// be completed. PartSize is only used when the upload has no stored parts.
+	// The reader must be seekable (io.ReaderAt or io.Seeker) and the object
+	// size must be known. An upload ID can be obtained from
+	// Core.NewMultipartUpload or from ListIncompleteUploads.
+	UploadID string
+
+	LegalHold            LegalHoldStatus
+	SendContentMd5       bool
+	DisableContentSha256 bool
+	DisableMultipart     bool
 
 	// AutoChecksum is the type of checksum that will be added if no other checksum is added,
 	// like MD5 or SHA256 streaming checksum, and it is feasible for the upload type.
@@ -328,10 +339,20 @@ func (a completedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].Part
 //     WARNING: Passing down '-1' will use memory and these cannot
 //     be reused for best outcomes for PutObject(), pass the size always.
 //
-// NOTE: Upon errors during upload multipart operation is entirely aborted.
+//   - Set PutObjectOptions.UploadID to continue an existing multipart upload.
+//     The part size already recorded on the server is used for the remaining
+//     parts; a size computed from the current object size does not have to
+//     match it.
+//
+// NOTE: Upon errors during a new multipart upload, the upload is entirely
+// aborted. A resumed upload is not aborted, so the stored parts remain
+// available for another resume attempt.
 func (c *Client) PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, size int64,
 	opts PutObjectOptions,
 ) (info UploadInfo, err error) {
+	if opts.UploadID != "" && opts.RDMABuffer != nil {
+		return UploadInfo{}, errInvalidArgument("UploadID cannot be used with RDMABuffer")
+	}
 	if opts.RDMABuffer != nil && c.rdmaEnabled {
 		// A reader alongside the buffer means stream it: libminiocpp pins one
 		// part at a time rather than the whole object, so this carries objects
@@ -365,6 +386,19 @@ func (c *Client) PutObject(ctx context.Context, bucketName, objectName string, r
 	if c.trailingHeaderSupport {
 		opts.AutoChecksum.SetDefault(ChecksumCRC32C)
 		addAutoChecksumHeaders(&opts)
+	}
+
+	if opts.UploadID != "" {
+		if opts.DisableMultipart {
+			return UploadInfo{}, errInvalidArgument("UploadID cannot be used with DisableMultipart")
+		}
+		if size < 0 {
+			return UploadInfo{}, errInvalidArgument("UploadID requires a known object size")
+		}
+		if s3utils.IsGoogleEndpoint(*c.endpointURL) {
+			return UploadInfo{}, errInvalidArgument("UploadID is not supported on Google Cloud Storage endpoints")
+		}
+		return c.putObjectMultipartResume(ctx, bucketName, objectName, reader, size, opts)
 	}
 
 	// NOTE: Streaming signature is not supported by GCS.

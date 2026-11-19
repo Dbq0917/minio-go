@@ -653,6 +653,7 @@ Uploads objects that are less than 128MiB in a single PUT operation. For objects
 | `opts.WebsiteRedirectLocation` | _string_                   | Specify a redirect for the object, to another object in the same bucket or to a external URL.                                                                                      |
 | `opts.SendContentMd5`          | _bool_                     | Specify if you'd like to send `content-md5` header with PutObject operation. Note that setting this flag will cause higher memory usage because of in-memory `md5sum` calculation. |
 | `opts.PartSize`                | _uint64_                   | Specify a custom part size used for uploading the object                                                                                                                           |
+| `opts.UploadID`                | _string_                   | Resume this multipart upload. The part size stored by the server is used instead of a size computed from the object size; `PartSize` only applies when no parts are stored yet.      |
 | `opts.Internal`                | _minio.AdvancedPutOptions_ | This option is intended for internal use by MinIO server and should not be set unless the application is aware of intended use.                                                    |
 |                                |                            |                                                                                                                                                                                    |
 
