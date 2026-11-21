@@ -110,6 +110,12 @@ type Client struct {
 	trailingHeaderSupport bool
 	maxRetries            int
 
+	// Bounds the part uploads this client has in flight and shares them
+	// fairly between concurrent uploads. Lazily initialized by
+	// partUploadSlots so a Client not built by New still works.
+	slotsOnce   sync.Once
+	uploadSlots *uploadScheduler
+
 	// Upload limits enforced before sending a request. Always read through
 	// its accessors, which resolve zero fields to the S3 defaults.
 	limits UploadLimits

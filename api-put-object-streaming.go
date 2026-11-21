@@ -115,6 +115,13 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 		return UploadInfo{}, err
 	}
 
+	// Cancel the workers when the function returns, so a worker waiting on
+	// a part number or a slot from the scheduler does not linger. The
+	// deferred abort below is registered after this one and therefore runs
+	// first, while the context is still live.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	withChecksum := c.trailingHeaderSupport
 
 	// Aborts the multipart upload in progress, if the
@@ -138,6 +145,11 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 
 	// Declare a channel that sends back the response of a part upload.
 	uploadedPartsCh := make(chan uploadedPartRes)
+
+	// Share the client's part-upload budget fairly with any other uploads
+	// running concurrently instead of each adding NumThreads of its own.
+	slots := c.partUploadSlots().begin(opts.getNumThreads())
+	defer slots.end()
 
 	// Used for readability, lastPartNumber is always totalPartsCount.
 	lastPartNumber := totalPartsCount
@@ -208,7 +220,19 @@ func (c *Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketN
 					sha256Hex:    "",
 					trailer:      trailer,
 				}
+				if err := slots.acquire(ctx); err != nil {
+					select {
+					case <-ctx.Done():
+					case uploadedPartsCh <- uploadedPartRes{
+						Error: err,
+					}:
+					}
+
+					// Exit the goroutine.
+					return
+				}
 				objPart, err := c.uploadPart(ctx, p)
+				slots.release()
 				if err != nil {
 					select {
 					case <-ctx.Done():
@@ -329,6 +353,11 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 	md5Hash := c.md5Hasher()
 	defer md5Hash.Close()
 
+	// Take part in the client's shared part-upload budget, so a serial
+	// upload neither starves nor is starved by concurrent parallel ones.
+	slots := c.partUploadSlots().begin(1)
+	defer slots.end()
+
 	// Total data read and written to server. should be equal to 'size' at the end of the call.
 	var totalUploadedSize int64
 
@@ -387,7 +416,11 @@ func (c *Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, b
 		// as we read from the source.
 		hooked := newHook(bytes.NewReader(buf[:length]), opts.Progress)
 		p := uploadPartParams{bucketName: bucketName, objectName: objectName, uploadID: uploadID, reader: hooked, partNumber: partNumber, md5Base64: md5Base64, size: partSize, sse: opts.ServerSideEncryption, streamSha256: !opts.DisableContentSha256, customHeader: customHeader}
+		if uerr := slots.acquire(ctx); uerr != nil {
+			return UploadInfo{}, uerr
+		}
 		objPart, uerr := c.uploadPart(ctx, p)
+		slots.release()
 		if uerr != nil {
 			return UploadInfo{}, uerr
 		}
@@ -500,6 +533,11 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 	// Initialize parts uploaded map.
 	partsInfo := make(map[int]ObjectPart)
 
+	// Share the client's part-upload budget fairly with any other uploads
+	// running concurrently instead of each adding NumThreads of its own.
+	slots := c.partUploadSlots().begin(int(opts.NumThreads))
+	defer slots.end()
+
 	// Create a buffer.
 	nBuffers := int64(opts.NumThreads)
 	bufs := make(chan []byte, nBuffers)
@@ -593,7 +631,12 @@ func (c *Client) putObjectMultipartStreamParallel(ctx context.Context, bucketNam
 				streamSha256: !opts.DisableContentSha256,
 				customHeader: customHeader,
 			}
+			if uerr := slots.acquire(ctx); uerr != nil {
+				errCh <- uerr
+				return
+			}
 			objPart, uerr := c.uploadPart(ctx, p)
+			slots.release()
 			if uerr != nil {
 				errCh <- uerr
 				return
